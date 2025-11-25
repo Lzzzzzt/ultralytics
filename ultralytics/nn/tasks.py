@@ -1554,6 +1554,7 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
+            DB_FDM,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1644,8 +1645,6 @@ def parse_model(d, ch, verbose=True):
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
-        elif m is DB_FDM:
-            args = [c1, c2, *args[1:]]
         else:
             c2 = ch[f]
 
