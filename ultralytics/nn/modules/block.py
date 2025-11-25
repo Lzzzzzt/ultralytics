@@ -52,6 +52,7 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "TorchVision",
+    "DB_FDM",
 )
 
 
@@ -1943,3 +1944,107 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+
+# -------------------------------------------------------------------------
+# 1. 坐标注意力机制 (Coordinate Attention) - 对应局部分支组件 [cite: 58]
+# -------------------------------------------------------------------------
+class CoordAtt(nn.Module):
+    def __init__(self, inp, oup, reduction=32):
+        super(CoordAtt, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, inp // reduction)
+
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.Hardswish()
+        
+        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+        n, c, h, w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y) 
+        
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        out = identity * a_h * a_w
+        return out
+
+# -------------------------------------------------------------------------
+# 2. LSKA (Large Selective Kernel Attention) - 对应全局分支组件 [cite: 50, 51]
+#    使用大核分解 (Depth-wise) 降低计算量
+# -------------------------------------------------------------------------
+class LSKA(nn.Module):
+    def __init__(self, dim, k_size=23): # 默认大核设为23 [cite: 55]
+        super().__init__()
+        
+        # 水平方向 1xK 卷积
+        self.conv0h = nn.Conv2d(dim, dim, kernel_size=(1, k_size), stride=1, padding=(0, k_size//2), groups=dim)
+        # 垂直方向 Kx1 卷积
+        self.conv0v = nn.Conv2d(dim, dim, kernel_size=(k_size, 1), stride=1, padding=(k_size//2, 0), groups=dim)
+        
+        # 空间卷积用于特征融合
+        self.conv_spatial = nn.Conv2d(dim, dim, kernel_size=7, stride=1, padding=3, dilation=1, groups=dim)
+        
+        # 通道注意力部分
+        self.conv1 = nn.Conv2d(dim, dim, 1)
+
+    def forward(self, x):
+        u = x.clone()
+        attn = self.conv0h(x)
+        attn = self.conv0v(attn)
+        attn = self.conv_spatial(attn)
+        attn = self.conv1(attn)
+        return u * attn
+
+# -------------------------------------------------------------------------
+# 3. DB-FDM 主模块 (Dual-Branch Feature Discrimination Module) 
+# -------------------------------------------------------------------------
+class DB_FDM(nn.Module):
+    def __init__(self, c1, c2, k=23):
+        super().__init__()
+        # 维度对齐
+        self.cv1 = nn.Conv2d(c1, c2, 1, 1) 
+        
+        # 分支1: 全局语义分支 (Global Semantic Branch) [cite: 54]
+        self.global_branch = LSKA(c2, k_size=k)
+        
+        # 分支2: 局部纹理分支 (Local Texture Branch) [cite: 57]
+        # 标准3x3卷积 + Coordinate Attention
+        self.local_conv = nn.Conv2d(c2, c2, 3, 1, 1, groups=c2) # Depthwise
+        self.local_att = CoordAtt(c2, c2)
+        
+        # 可学习融合系数 alpha [cite: 61]
+        # 初始化为0，经过sigmoid后为0.5，表示初始时两个分支权重相等
+        self.alpha = nn.Parameter(torch.zeros(1)) 
+
+    def forward(self, x):
+        x = self.cv1(x)
+        
+        # 全局特征提取
+        f_global = self.global_branch(x)
+        
+        # 局部特征提取
+        f_local = self.local_conv(x)
+        f_local = self.local_att(f_local)
+        
+        # 动态加权融合 [cite: 61]
+        # F_out = alpha * F_global + (1 - alpha) * F_local
+        weight = torch.sigmoid(self.alpha)
+        f_out = weight * f_global + (1 - weight) * f_local
+        
+        return f_out
