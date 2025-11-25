@@ -211,7 +211,7 @@ class v8DetectionLoss:
         self.use_dfl = m.reg_max > 1
 
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
-        self.bbox_loss = BboxLoss(m.reg_max).to(device)
+        self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=self.use_dfl).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
@@ -236,8 +236,6 @@ class v8DetectionLoss:
         if self.use_dfl:
             b, a, c = pred_dist.shape  # batch, anchors, channels
             pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
-            # pred_dist = pred_dist.view(b, a, c // 4, 4).transpose(2,3).softmax(3).matmul(self.proj.type(pred_dist.dtype))
-            # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -264,11 +262,8 @@ class v8DetectionLoss:
 
         # Pboxes
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
-        # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
-        # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
 
         _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
-            # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
             anchor_points * stride_tensor,
@@ -279,9 +274,30 @@ class v8DetectionLoss:
 
         target_scores_sum = max(target_scores.sum(), 1)
 
-        # Cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        # -------------------------------------------------------------------------
+        # Cls loss (原有代码被注释，替换为 AFS-Loss)
+        # loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # Original BCE
+
+        # === 创新点三：AFS-Loss (Adaptive Focal-Smoothing Loss) 实现 ===
+        # 1. 计算基础 BCE Loss (保留每个样本的 Loss, reduction='none' 是 YOLO 默认配置)
+        loss_bce = self.bce(pred_scores, target_scores.to(dtype))
+
+        # 2. 计算预测概率 (Sigmoid)
+        pred_probs = pred_scores.sigmoid()
+
+        # 3. 计算难易度 (Difficulty / Deviation)
+        # 定义：预测值与目标值(包含Label Smoothing的软标签)之间的绝对距离
+        # 距离越大，说明样本越难(遮挡或混淆)，需要更大的权重
+        difficulty = torch.abs(pred_probs - target_scores.to(dtype))
+
+        # 4. 计算聚焦因子 (Focal Factor)
+        # gamma 是聚焦参数，建议 1.5 或 2.0
+        gamma = 1.5
+        focal_weight = torch.pow(difficulty, gamma)
+
+        # 5. 加权融合并归一化
+        loss[1] = (loss_bce * focal_weight).sum() / target_scores_sum
+        # -------------------------------------------------------------------------
 
         # Bbox loss
         if fg_mask.sum():
@@ -849,3 +865,91 @@ class TVPSegmentLoss(TVPDetectLoss):
         vp_loss = self.vp_criterion((vp_feats, pred_masks, proto), batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
+
+
+class AFSLoss(nn.Module):
+    """
+    Adaptive Focal-Smoothing Loss (AFS-Loss)
+    Innovation Point 3: Combining Soft Labels with Focal Modulation
+    """
+
+    def __init__(self, nc, gamma=2.0, epsilon=0.1, reduction="mean"):
+        super(AFSLoss, self).__init__()
+        self.nc = nc  # 类别数
+        self.gamma = gamma  # 聚焦参数
+        self.epsilon = epsilon  # 平滑参数
+        self.reduction = reduction
+
+    def forward(self, pred_logits, target_labels):
+        """
+        pred_logits: 模型预测的原始 logits (Batch, NC)
+        target_labels: 真实标签索引 (Batch)
+        """
+        # 1. 计算 Soft Labels (标签平滑)
+        # 创建 One-hot 矩阵
+        with torch.no_grad():
+            true_dist = torch.zeros_like(pred_logits)
+            true_dist.fill_(self.epsilon / self.nc)
+            true_dist.scatter_(1, target_labels.unsqueeze(1), 1 - self.epsilon + self.epsilon / self.nc)
+
+        # 2. 计算 Softmax 概率
+        pred_probs = F.softmax(pred_logits, dim=1)
+
+        # 3. 计算 Cross Entropy 部分 (基于 Soft Labels)
+        # log_probs = F.log_softmax(pred_logits, dim=1)
+        # ce_loss = - torch.sum(true_dist * log_probs, dim=1)
+        # 上面是普通写法，为了数值稳定，建议如下：
+        log_probs = F.log_softmax(pred_logits, dim=1)
+
+        # 4. 计算 Focal Modulation Factor (聚焦因子)
+        # 获取目标类别的预测概率 p_t
+        target_probs = pred_probs.gather(1, target_labels.unsqueeze(1)).squeeze(1)
+        focal_weight = (1 - target_probs) ** self.gamma
+
+        # 5. 融合: Focal Weight * Smoothed CE Loss
+        # 注意：这里我们对整个 smoothed loss 进行加权
+        loss = focal_weight * (-torch.sum(true_dist * log_probs, dim=1))
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        else:
+            return loss
+
+
+class AFSLoss_Sigmoid(nn.Module):
+    def __init__(self, gamma=2.0, epsilon=0.1):
+        super().__init__()
+        self.gamma = gamma
+        self.epsilon = epsilon
+        # 设置 reduction='none' 是为了保留每个样本的 loss，以便后续乘以权重
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+
+    def forward(self, pred_logits, true_labels):
+        """
+        pred_logits: [Batch, Class] 模型输出的原始 Logits
+        true_labels: [Batch, Class] 经过 Label Smoothing 的软标签
+        """
+
+        # 1. 计算基础的 BCE Loss (基于 Soft Labels)
+        loss_bce = self.bce(pred_logits, true_labels)
+
+        # 2. 计算预测概率 (Sigmoid)
+        pred_probs = torch.sigmoid(pred_logits)
+
+        # 3. 计算难易度 (Difficulty) - 这里替代了之前的 p_t
+        # 逻辑：预测值与真实值差距越大，代表样本越难，diff 越接近 1
+        # 如果是 Label Smoothing 后的标签(如0.9)，预测0.1，则 diff=0.8 (难)
+        # 如果是 Label Smoothing 后的标签(如0.9)，预测0.9，则 diff=0.0 (易)
+        difficulty = torch.abs(pred_probs - true_labels)
+
+        # 4. 计算聚焦因子 (Focal Factor)
+        # 类似于 Focal Loss 中的 (1-pt)^gamma，这里直接用 difficulty^gamma
+        focal_factor = torch.pow(difficulty, self.gamma)
+
+        # 5. 最终损失 = 聚焦因子 * BCE损失
+        # 困难样本会获得更大的权重，简单样本权重趋近于0
+        loss = focal_factor * loss_bce
+
+        return loss.sum()
