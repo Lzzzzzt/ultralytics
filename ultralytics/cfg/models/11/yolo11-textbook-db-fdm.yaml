@@ -1,9 +1,10 @@
-# Ultralytics YOLO 🚀, AGPL-3.0 license
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
 # Classroom-YOLOv11: 针对教材识别优化的模型
 # 包含创新点二: DB-FDM (Dual-Branch Feature Discrimination Module)
 
 # Parameters
-nc: 48  # 根据论文数据集统计，类别数量为48 (学科_版本_年级_册别) 
+nc: 48 # 根据论文数据集统计，类别数量为48 (学科_版本_年级_册别)
 scales: # model compound scaling constants, i.e. 'n', 's', 'm', 'l', 'x'
   n: [0.50, 0.25, 1024] # summary: 319 layers, 2624080 parameters, 2624064 gradients, 6.6 GFLOPs
   s: [0.50, 0.50, 1024]
@@ -14,46 +15,46 @@ scales: # model compound scaling constants, i.e. 'n', 's', 'm', 'l', 'x'
 # YOLOv11.0n backbone
 backbone:
   # [from, repeats, module, args]
-  - [-1, 1, Conv, [64, 3, 2]]  # 0-P1/2
-  - [-1, 1, Conv, [128, 3, 2]]  # 1-P2/4
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
   - [-1, 2, C3k2, [256, False, 0.25]]
-  - [-1, 1, Conv, [256, 3, 2]]  # 3-P3/8
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
   - [-1, 2, C3k2, [512, False, 0.25]]
-  - [-1, 1, Conv, [512, 3, 2]]  # 5-P4/16
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
   - [-1, 2, C3k2, [512, True]]
-  - [-1, 1, Conv, [1024, 3, 2]]  # 7-P5/32
+  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
   - [-1, 2, C3k2, [1024, True]]
-  - [-1, 1, SPPF, [1024, 5]]  # 9
+  - [-1, 1, SPPF, [1024, 5]] # 9
 
 # YOLOv11.0n head with DB-FDM
 head:
-  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
-  - [[-1, 6], 1, Concat, [1]]  # cat backbone P4
-  
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]] # cat backbone P4
+
   # -----------------------------------------------------------------------
   # 创新点二：DB-FDM 模块 (P4层级)
   # 修复点：必须显式指定输出通道 [512]，解决 IndexError
-  # 作用：在深层特征处利用 LSKA 区分语义(全局)与纹理(局部)，解决相似封面混淆 
+  # 作用：在深层特征处利用 LSKA 区分语义(全局)与纹理(局部)，解决相似封面混淆
   # -----------------------------------------------------------------------
-  - [-1, 2, DB_FDM, [512]]  # 12
-  
-  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
-  - [[-1, 4], 1, Concat, [1]]  # cat backbone P3
-  
+  - [-1, 2, DB_FDM, [512]] # 12
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]] # cat backbone P3
+
   # -----------------------------------------------------------------------
   # 创新点二：DB-FDM 模块 (P3层级)
   # 修复点：必须显式指定输出通道 [256]，解决 IndexError
   # -----------------------------------------------------------------------
-  - [-1, 2, DB_FDM, [256]]  # 15 (P3/8-small)
+  - [-1, 2, DB_FDM, [256]] # 15 (P3/8-small)
 
   # 下采样路径 (Downsample Path)
   - [-1, 1, Conv, [256, 3, 2]]
-  - [[-1, 12], 1, Concat, [1]]  # cat head P4 (注意索引指向第12层 DB_FDM 的输出)
-  - [-1, 2, C3k2, [512, False]]  # 18 (P4/16-medium)
+  - [[-1, 12], 1, Concat, [1]] # cat head P4 (注意索引指向第12层 DB_FDM 的输出)
+  - [-1, 2, C3k2, [512, False]] # 18 (P4/16-medium)
 
   - [-1, 1, Conv, [512, 3, 2]]
-  - [[-1, 9], 1, Concat, [1]]  # cat head P5
-  - [-1, 2, C3k2, [1024, True]]  # 21 (P5/32-large)
+  - [[-1, 9], 1, Concat, [1]] # cat head P5
+  - [-1, 2, C3k2, [1024, True]] # 21 (P5/32-large)
 
   # Detect Head
-  - [[15, 18, 21], 1, Detect, [nc]]  # Detect(P3, P4, P5)
+  - [[15, 18, 21], 1, Detect, [nc]] # Detect(P3, P4, P5)
