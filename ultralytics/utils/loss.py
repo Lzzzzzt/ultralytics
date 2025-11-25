@@ -294,7 +294,7 @@ class v8DetectionLoss:
 
         # 4. 计算聚焦因子 (Focal Factor)
         # gamma 是聚焦参数，建议 1.5 或 2.0
-        gamma = 1.5
+        gamma = 1
         focal_weight = torch.pow(difficulty, gamma)
 
         # 5. 加权融合并归一化
