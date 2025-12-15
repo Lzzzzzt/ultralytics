@@ -24,6 +24,7 @@ from .block import (
     C3,
     C3TR,
     CIB,
+    DB_FDM,
     DFL,
     ELAN1,
     PSA,
@@ -59,7 +60,6 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
-    DB_FDM,
 )
 from .conv import (
     CBAM,
@@ -112,6 +112,7 @@ __all__ = (
     "C3TR",
     "CBAM",
     "CIB",
+    "DB_FDM",
     "DFL",
     "ELAN1",
     "MLP",
@@ -180,5 +181,4 @@ __all__ = (
     "YOLOEDetect",
     "YOLOESegment",
     "v10Detect",
-    "DB_FDM",
 )
